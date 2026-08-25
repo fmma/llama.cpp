@@ -10,6 +10,7 @@
 #include <array>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <regex>
@@ -562,7 +563,11 @@ llama_model_loader::llama_model_loader(
     tensor_buft_overrides = param_tensor_buft_overrides_p;
 
     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
-    this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
+    this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO || load_mode == LLAMA_LOAD_MODE_OPENDS;
+
+    if (load_mode == LLAMA_LOAD_MODE_OPENDS) {
+        opends.reset(new llama_opends());
+    }
 
     if (!fname.empty()) {
         // Load the main GGUF
@@ -1562,6 +1567,44 @@ const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, 
     return data;
 }
 
+bool llama_model_loader::load_tensor_opends(const llama_tensor_weight & weight, struct ggml_tensor * cur,
+        std::vector<opends_body> & bodies) {
+    const auto & file = files.at(weight.idx);
+    if (!file->has_direct_io()) {
+        return false;
+    }
+    if (!opends->file_ok(weight.idx, file->file_id())) {
+        return false;
+    }
+
+    ggml_backend_buffer_t buf = cur->buffer;
+    if (buf == nullptr || ggml_backend_buffer_is_host(buf)) {
+        // aisio cannot register host memory, load through the host path
+        return false;
+    }
+    void * base = ggml_backend_buffer_get_base(buf);
+    if (base == nullptr) {
+        return false;
+    }
+    if (!opends->buffer_ok(base, ggml_backend_buffer_get_size(buf))) {
+        return false;
+    }
+
+    const size_t n_size  = ggml_nbytes(cur);
+    const size_t offs    = weight.offs;
+    const size_t dst_off = (const char *) cur->data - (const char *) base;
+
+    // opends bounces a partial block at either end of the read, but an
+    // unaligned start shifts the destination of the whole blocks behind it and
+    // an NVMe PRP offset only expresses that down to a dword
+    if (offs % 4 != 0) {
+        return false;
+    }
+
+    bodies.push_back({weight.idx, base, n_size, (off_t) offs, (off_t) dst_off});
+    return true;
+}
+
 bool llama_model_loader::load_all_data(
         struct ggml_context * ctx,
         std::vector<ggml_backend_buffer_t> & bufs,
@@ -1577,6 +1620,7 @@ bool llama_model_loader::load_all_data(
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
 
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
+    std::vector<opends_body> opends_bodies;
 
     // 4 staging buffers for async uploads, each sized 1MB seems to be a good default for single NVMe drives.
     // NVMe raid configurations might require more / larger buffers.
@@ -1590,12 +1634,42 @@ bool llama_model_loader::load_all_data(
     // Buffer size: balance between memory usage and I/O efficiency
     const size_t buffer_size = alignment != 1 ? LLAMA_DIRECT_IO_BUFFER_SIZE + 2 * alignment : 1 * 1024 * 1024;
 
+    // when using opends, pre-register all destination buffers; if every tensor can be
+    // served by opends the pinned staging buffers below are not needed
+    const int64_t t_reg_start = ggml_time_us();
+
+    bool opends_full = false;
+    if (opends && opends->ok() && !use_mmap && !check_tensors) {
+        opends_full = true;
+        for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
+            const auto * weight = get_weight(ggml_get_name(cur));
+            if (weight == nullptr) {
+                continue;
+            }
+            if (cur->buffer && ggml_backend_buffer_is_host(cur->buffer)) {
+                continue;
+            }
+            const auto & file = files.at(weight->idx);
+            if (!file->has_direct_io() || !opends->file_ok(weight->idx, file->file_id())) {
+                opends_full = false;
+                break;
+            }
+            void * base = cur->buffer ? ggml_backend_buffer_get_base(cur->buffer) : nullptr;
+            if (base == nullptr || !opends->buffer_ok(base, ggml_backend_buffer_get_size(cur->buffer))) {
+                opends_full = false;
+                break;
+            }
+        }
+    }
+
+    const int64_t t_reg_end = ggml_time_us();
+
     std::vector<ggml_backend_buffer_t> host_buffers;
     std::vector<ggml_backend_event_t> events;
     std::vector<void *> host_ptrs;
     size_t buffer_idx = 0; // buffer to use for async loads
     ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
-        if (use_mmap || check_tensors) {
+        if (use_mmap || check_tensors || opends_full) {
             return nullptr;
         }
         // When not using mmaped io use async uploads from pinned memory to GPU memory.
@@ -1676,6 +1750,10 @@ bool llama_model_loader::load_all_data(
     }
 
     std::vector<ggml_tensor *> tensors;
+
+    const int64_t t_loop_start = ggml_time_us();
+    size_t bytes_this_call = 0;
+
     for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx); cur != NULL; cur = ggml_get_next_tensor(ctx, cur)) {
         tensors.push_back(cur);
     }
@@ -1704,6 +1782,9 @@ bool llama_model_loader::load_all_data(
 
         if (progress_callback) {
             if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
+                if (opends) {
+                    opends->drain();
+                }
                 return false;
             }
         }
@@ -1751,7 +1832,9 @@ bool llama_model_loader::load_all_data(
         } else {
             const auto & file = files.at(weight->idx);
 
-            if (ggml_backend_buffer_is_host(cur->buffer)) {
+            if (opends && !check_tensors && load_tensor_opends(*weight, cur, opends_bodies)) {
+                // tensor data was read directly into the destination buffer
+            } else if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
                 if (check_tensors) {
@@ -1841,12 +1924,74 @@ bool llama_model_loader::load_all_data(
         }
 
         size_done += n_size;
+        bytes_this_call += n_size;
+    }
+
+    const int64_t t_loop_end = ggml_time_us();
+
+    // the drive is much faster when the reads walk the file forwards
+    std::sort(opends_bodies.begin(), opends_bodies.end(),
+        [](const opends_body & a, const opends_body & b) {
+            return a.idx != b.idx ? a.idx < b.idx : a.file_offset < b.file_offset;
+        });
+
+    // one read per run of tensors that are adjacent in both the file and the
+    // buffer. exact adjacency refuses anything the cuda allocator padded, and
+    // partial offload or -ot just gives shorter runs
+    const size_t n_tensors_opends = opends_bodies.size();
+    {
+        std::vector<opends_body> runs;
+        runs.reserve(opends_bodies.size());
+        for (const auto & b : opends_bodies) {
+            if (!runs.empty()) {
+                auto & r = runs.back();
+                if (r.idx == b.idx && r.base == b.base &&
+                    r.file_offset + (off_t) r.size == b.file_offset &&
+                    r.buf_offset  + (off_t) r.size == b.buf_offset) {
+                    r.size += b.size;
+                    continue;
+                }
+            }
+            runs.push_back(b);
+        }
+        opends_bodies = std::move(runs);
+    }
+
+    size_t opends_bytes = 0;
+    for (const auto & b : opends_bodies) {
+        if (!opends->read_async(b.idx, b.base, b.size, b.file_offset, b.buf_offset)) {
+            opends->drain();
+            throw std::runtime_error("opends submit failed");
+        }
+        opends_bytes += b.size;
+    }
+
+    const int64_t t_submit_end = ggml_time_us();
+
+    if (opends && !opends->drain()) {
+        throw std::runtime_error("opends read failed");
+    }
+
+    if (opends) {
+        const int64_t t_drain_end = ggml_time_us();
+        LLAMA_LOG_DEBUG("%s: opends %zu ops (%zu tensors) %.1f MiB: register %.1f ms, loop %.1f ms, submit %.1f ms, drain %.1f ms (%.2f GB/s)\n",
+            __func__, opends_bodies.size(), n_tensors_opends, opends_bytes / 1048576.0,
+            (t_reg_end - t_reg_start) / 1000.0, (t_loop_end - t_loop_start) / 1000.0,
+            (t_submit_end - t_loop_end) / 1000.0, (t_drain_end - t_submit_end) / 1000.0,
+            opends_bytes / (double) (t_drain_end - t_loop_end) / 1000.0);
     }
 
     // free temporary resources used for async uploads
     for (auto * event : events) {
         ggml_backend_event_synchronize(event);
         ggml_backend_event_free(event);
+    }
+
+    if (bytes_this_call > 0) {
+        const int64_t t_end = ggml_time_us();
+        LLAMA_LOG_DEBUG("%s: %.1f MiB in %.1f ms = %.2f GB/s\n", __func__,
+            bytes_this_call / 1048576.0, (t_end - t_loop_start) / 1000.0,
+            bytes_this_call / (double) (t_end - t_loop_start) / 1000.0);
     }
     for (auto * buf : host_buffers) {
         ggml_backend_buffer_free(buf);
@@ -1868,6 +2013,13 @@ bool llama_model_loader::load_all_data(
 
     // check if this is the last call and do final cleanup
     if (size_done >= size_data) {
+        // release opends registrations and driver
+        const int64_t t_close_start = ggml_time_us();
+        const bool had_opends = opends != nullptr;
+        opends.reset();
+        if (had_opends) {
+            LLAMA_LOG_DEBUG("%s: opends teardown %.1f ms\n", __func__, (ggml_time_us() - t_close_start) / 1000.0);
+        }
         // unmap offloaded tensors and metadata
         if (use_mmap) {
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {

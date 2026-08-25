@@ -6,6 +6,7 @@
 #include "llama-arch.h"
 #include "llama-hparams.h"
 #include "llama-mmap.h"
+#include "llama-opends.h"
 
 #include "ggml-cpp.h"
 
@@ -120,6 +121,8 @@ struct llama_model_loader {
     llama_fver  fver;
 
     llama_mmaps mappings;
+
+    std::unique_ptr<llama_opends> opends;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
@@ -257,6 +260,21 @@ struct llama_model_loader {
     // read a byte range of a weight's data
     // with mmap, returns a pointer into the mapping, otherwise reads into buf and returns buf
     const void * load_data_range(const llama_tensor_weight & w, size_t offs, size_t size, void * buf) const;
+
+    // one deferred opends read, submitted after the whole tensor loop so the
+    // reads can be ordered by file offset
+    struct opends_body {
+        int    idx;
+        void * base;
+        size_t size;
+        off_t  file_offset;
+        off_t  buf_offset;
+    };
+
+    // queue a tensor for opends to read straight into its destination buffer
+    // returns false if the tensor cannot be served by opends and a fallback path must be used
+    bool load_tensor_opends(const llama_tensor_weight & weight, struct ggml_tensor * cur,
+            std::vector<opends_body> & bodies);
 
     // Returns false if cancelled by progress_callback
     bool load_all_data(
