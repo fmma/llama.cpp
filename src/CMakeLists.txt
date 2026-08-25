@@ -35,6 +35,7 @@ set(LLAMA_CORE_SOURCES
     llama-memory-recurrent.cpp
     llama-mmap.cpp
     llama-model-loader.cpp
+    llama-opends.cpp
     llama-model-saver.cpp
     llama-model.cpp
     llama-quant.cpp
@@ -70,6 +71,18 @@ target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
+
+if (LLAMA_OPENDS)
+    find_path(OPENDS_INCLUDE_DIR opends.h HINTS ${LLAMA_OPENDS_DIR} PATH_SUFFIXES include)
+    find_library(OPENDS_LIBRARY opends_${LLAMA_OPENDS_BACKEND} HINTS ${LLAMA_OPENDS_DIR} PATH_SUFFIXES lib build lib/x86_64-linux-gnu)
+    if (NOT OPENDS_INCLUDE_DIR OR NOT OPENDS_LIBRARY)
+        message(FATAL_ERROR "LLAMA_OPENDS: opends.h or libopends_${LLAMA_OPENDS_BACKEND} not found, set LLAMA_OPENDS_DIR")
+    endif()
+    message(STATUS "OpenDS enabled: ${OPENDS_LIBRARY}")
+    target_include_directories(llama PRIVATE ${OPENDS_INCLUDE_DIR})
+    target_link_libraries(llama PRIVATE ${OPENDS_LIBRARY} ${CMAKE_DL_LIBS})
+    target_compile_definitions(llama PRIVATE LLAMA_USE_OPENDS)
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

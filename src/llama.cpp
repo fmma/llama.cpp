@@ -10,6 +10,7 @@
 #include "llama-model-loader.h"
 #include "llama-model-saver.h"
 #include "llama-model.h"
+#include "llama-opends.h"
 
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -61,6 +62,8 @@ const char * llama_load_mode_name(enum llama_load_mode load_mode) {
             return "mmap+mlock";
         case LLAMA_LOAD_MODE_DIRECT_IO:
             return "dio";
+        case LLAMA_LOAD_MODE_OPENDS:
+            return "opends";
     }
     GGML_ABORT("fatal error");
 }
@@ -72,6 +75,7 @@ enum llama_load_mode llama_load_mode_from_str(const char * str) {
     if (std::strcmp(str, "mlock")      == 0) { return LLAMA_LOAD_MODE_MLOCK;      }
     if (std::strcmp(str, "mmap+mlock") == 0) { return LLAMA_LOAD_MODE_MMAP_MLOCK; }
     if (std::strcmp(str, "dio")        == 0) { return LLAMA_LOAD_MODE_DIRECT_IO;  }
+    if (std::strcmp(str, "opends")     == 0) { return LLAMA_LOAD_MODE_OPENDS;     }
     GGML_ABORT("unknown load mode: %s", str);
 }
 
@@ -147,6 +151,7 @@ void llama_numa_init(enum ggml_numa_strategy numa) {
 }
 
 void llama_backend_free(void) {
+    llama_opends::shutdown();
     ggml_quantize_free();
 }
 

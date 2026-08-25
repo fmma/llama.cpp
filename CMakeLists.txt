@@ -128,6 +128,11 @@ option(LLAMA_SANITIZE_UNDEFINED "llama: enable undefined sanitizer" OFF)
 # utils
 option(LLAMA_BUILD_COMMON "llama: build common utils library" ${LLAMA_STANDALONE})
 
+# extra libraries
+option(LLAMA_OPENDS "llama: use OpenDS for direct storage model loading" OFF)
+set(LLAMA_OPENDS_BACKEND "aisio" CACHE STRING "llama: OpenDS backend library to link (aisio, cufile)")
+set(LLAMA_OPENDS_DIR "" CACHE PATH "llama: OpenDS install or source directory hint")
+
 # extra artifacts
 option(LLAMA_BUILD_TESTS     "llama: build tests"                                                                ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_TOOLS     "llama: build tools"                                                                ${LLAMA_STANDALONE})
