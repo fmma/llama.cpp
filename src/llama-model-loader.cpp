@@ -1957,6 +1957,33 @@ bool llama_model_loader::load_all_data(
         opends_bodies = std::move(runs);
     }
 
+    // interleave the runs across files so a sharded model keeps every drive
+    // busy from the first submit; within a file the runs stay in file order
+    {
+        std::vector<size_t> group_start;
+        for (size_t i = 0; i < opends_bodies.size(); i++) {
+            if (i == 0 || opends_bodies[i].idx != opends_bodies[i - 1].idx) {
+                group_start.push_back(i);
+            }
+        }
+        group_start.push_back(opends_bodies.size());
+        if (group_start.size() > 2) {
+            std::vector<opends_body> interleaved;
+            interleaved.reserve(opends_bodies.size());
+            std::vector<size_t> cursor(group_start.begin(), group_start.end() - 1);
+            for (bool progress = true; progress; ) {
+                progress = false;
+                for (size_t g = 0; g + 1 < group_start.size(); g++) {
+                    if (cursor[g] < group_start[g + 1]) {
+                        interleaved.push_back(opends_bodies[cursor[g]++]);
+                        progress = true;
+                    }
+                }
+            }
+            opends_bodies = std::move(interleaved);
+        }
+    }
+
     size_t opends_bytes = 0;
     for (const auto & b : opends_bodies) {
         if (!opends->read_async(b.idx, b.base, b.size, b.file_offset, b.buf_offset)) {
